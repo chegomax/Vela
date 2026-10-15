@@ -7,9 +7,13 @@ import type { Unsubscribe } from '../../../core/util/types';
 const SPOT_BASE = 'https://api.binance.com/api/v3';
 const SPOT_BASE_US = 'https://api.binance.us/api/v3';
 const FUTURES_BASE = 'https://fapi.binance.com/fapi/v1';
+const COIN_FUTURES_BASE = 'https://dapi.binance.com/dapi/v1';
 const SPOT_WS = 'wss://stream.binance.com:9443';
 const SPOT_WS_US = 'wss://stream.binance.us:9443';
 const FUTURES_WS = 'wss://fstream.binance.com';
+const COIN_FUTURES_WS = 'wss://dstream.binance.com';
+/** Futures contract types that expire (listed with `.D` / `.C`), as opposed to perpetuals. */
+const DELIVERY_TYPES = ['CURRENT_QUARTER', 'NEXT_QUARTER'];
 /**
  * If a kline socket opens but delivers no candle within this window, treat it as
  * non-delivering and fall back to polling. Covers a socket that connects but stays
@@ -52,11 +56,24 @@ export function normalizeTf(tf: string): string {
     return TF_NORMALIZE[tf] ?? TF_NORMALIZE[tf.toLowerCase()] ?? tf;
 }
 
-/** Split a Vela ticker into the Binance API symbol + whether it's a perpetual future (`.P`). */
-export function parseTicker(ticker: string): { apiSymbol: string; isFutures: boolean } {
+/**
+ * Split a Vela ticker into the Binance API symbol + the market it lives on:
+ * `.P` is a USDⓈ-M perpetual, `.D` a USDⓈ-M delivery (quarterly) contract — both served by
+ * the USDⓈ-M endpoint — and `.C` a COIN-M contract (`coinM`), served by its own endpoint.
+ */
+export function parseTicker(ticker: string): { apiSymbol: string; isFutures: boolean; coinM?: true } {
     const t = ticker.trim().toUpperCase();
-    if (t.endsWith('.P')) return { apiSymbol: t.slice(0, -2), isFutures: true };
+    if (t.endsWith('.P') || t.endsWith('.D')) return { apiSymbol: t.slice(0, -2), isFutures: true };
+    if (t.endsWith('.C')) return { apiSymbol: t.slice(0, -2), isFutures: true, coinM: true };
     return { apiSymbol: t, isFutures: false };
+}
+
+/** Display label for a futures contract; a perpetual (or an unknown type) reads as "Perpetual". */
+function contractLabel(s: Pick<BinanceSymbol, 'symbol' | 'contractType'>): string {
+    const expiry = s.symbol.split('_')[1] ?? '';
+    if (s.contractType === 'CURRENT_QUARTER') return `Quarterly ${expiry}`.trim();
+    if (s.contractType === 'NEXT_QUARTER') return `Next Quarterly ${expiry}`.trim();
+    return 'Perpetual';
 }
 
 /** Map raw Binance klines to neutral OHLCV (open-time in epoch ms). */
@@ -138,8 +155,9 @@ export class BinanceProvider implements DataProvider {
 
     async getBars(ticker: string, timeframe: string, range: BarRange): Promise<OHLCV[]> {
         try {
-            const { apiSymbol, isFutures } = parseTicker(ticker);
-            const base = isFutures ? FUTURES_BASE : await this.spotBase();
+            const parsed = parseTicker(ticker);
+            const { apiSymbol } = parsed;
+            const base = await this.restBase(parsed);
             const tf = normalizeTf(timeframe);
 
             const nativeInterval = TF_TO_INTERVAL[tf];
@@ -169,8 +187,9 @@ export class BinanceProvider implements DataProvider {
 
 
     async getSymbolInfo(ticker: string): Promise<SymbolInfo | undefined> {
-        const { apiSymbol, isFutures } = parseTicker(ticker);
-        const base = isFutures ? FUTURES_BASE : await this.spotBase();
+        const parsed = parseTicker(ticker);
+        const { apiSymbol, isFutures, coinM } = parsed;
+        const base = await this.restBase(parsed);
         // Spot accepts ?symbol=; the futures exchangeInfo returns all symbols.
         const url = isFutures ? `${base}/exchangeInfo` : `${base}/exchangeInfo?symbol=${apiSymbol}`;
         const data = (await this.json(url).catch(() => null)) as { symbols?: BinanceSymbol[] } | null;
@@ -184,7 +203,7 @@ export class BinanceProvider implements DataProvider {
             ticker, // keep the original, incl. any .P (as Pine Script expects)
             tickerid: `BINANCE:${ticker}`,
             prefix: 'BINANCE',
-            description: `${s.baseAsset} / ${s.quoteAsset}${isFutures ? ' Perpetual' : ''}`,
+            description: `${s.baseAsset} / ${s.quoteAsset}${isFutures ? ` ${contractLabel(s)}` : ''}${coinM ? ' (COIN-M)' : ''}`,
             type: isFutures ? 'futures' : 'crypto',
             basecurrency: s.baseAsset,
             currency: s.quoteAsset,
@@ -197,10 +216,17 @@ export class BinanceProvider implements DataProvider {
 
     listSymbols(): Promise<SymbolDescriptor[]> {
         if (!this.symbolsPromise) {
+            // One market failing (e.g. blocked in the viewer's region) must not hide the others,
+            // but say so — otherwise the missing list looks like a bug.
+            const soft = (what: string) => (e: unknown): SymbolDescriptor[] => {
+                console.warn(`[vela] Binance: could not list ${what} — ${e instanceof Error ? e.message : String(e)}`);
+                return [];
+            };
             this.symbolsPromise = Promise.all([
-                this.listSpot().catch(() => [] as SymbolDescriptor[]),
-                this.listFutures().catch(() => [] as SymbolDescriptor[]),
-            ]).then(([spot, futures]) => [...spot, ...futures]);
+                this.listSpot().catch(soft('spot symbols')),
+                this.listFutures().catch(soft('USDⓈ-M futures')),
+                this.listCoinM().catch(soft('COIN-M futures')),
+            ]).then(([spot, futures, coinM]) => [...spot, ...futures, ...coinM]);
         }
         return this.symbolsPromise;
     }
@@ -212,11 +238,11 @@ export class BinanceProvider implements DataProvider {
     }
 
     subscribe(ticker: string, timeframe: string, onBar: (bar: OHLCV) => void): Unsubscribe {
-        const { apiSymbol, isFutures } = parseTicker(ticker);
+        const { apiSymbol, isFutures, coinM } = parseTicker(ticker);
         const interval = TF_TO_INTERVAL[normalizeTf(timeframe)];
         // Native interval + a WebSocket implementation ⇒ true streaming. Otherwise
         // (aggregated timeframe, or no WebSocket) fall back to polling getBars.
-        if (interval && typeof WebSocket !== 'undefined') return this.streamKlines(ticker, timeframe, apiSymbol, isFutures, interval, onBar);
+        if (interval && typeof WebSocket !== 'undefined') return this.streamKlines(ticker, timeframe, apiSymbol, isFutures, coinM === true, interval, onBar);
         return this.pollBars(ticker, timeframe, onBar);
     }
 
@@ -236,7 +262,7 @@ export class BinanceProvider implements DataProvider {
      * futures) still yields live updates instead of a silently-dead feed.
      */
     private streamKlines(
-        ticker: string, timeframe: string, apiSymbol: string, isFutures: boolean, interval: string, onBar: (bar: OHLCV) => void,
+        ticker: string, timeframe: string, apiSymbol: string, isFutures: boolean, coinM: boolean, interval: string, onBar: (bar: OHLCV) => void,
     ): Unsubscribe {
         let closed = false;
         let ws: WebSocket | null = null;
@@ -260,7 +286,7 @@ export class BinanceProvider implements DataProvider {
 
         const open = async (): Promise<void> => {
             if (closed) return;
-            const base = isFutures ? FUTURES_WS : await this.spotWsBase();
+            const base = coinM ? COIN_FUTURES_WS : isFutures ? FUTURES_WS : await this.spotWsBase();
             if (closed) return; // unsubscribed during the host probe
             ws = new WebSocket(`${base}/ws/${stream}`);
             stall = setTimeout(fallToPolling, STREAM_STALL_MS); // watchdog: data must arrive
@@ -283,6 +309,12 @@ export class BinanceProvider implements DataProvider {
             polling?.();
             try { ws?.close(); } catch { /* ignore */ }
         };
+    }
+
+    /** REST base for a parsed ticker's market (spot resolves to a reachable mirror). */
+    private restBase(p: { isFutures: boolean; coinM?: true }): Promise<string> {
+        if (p.coinM) return Promise.resolve(COIN_FUTURES_BASE);
+        return p.isFutures ? Promise.resolve(FUTURES_BASE) : this.spotBase();
     }
 
     /** WebSocket host matching the resolved REST spot endpoint (`.com` default, else `.us`). */
@@ -317,9 +349,30 @@ export class BinanceProvider implements DataProvider {
 
     private async listFutures(): Promise<SymbolDescriptor[]> {
         const data = (await this.json(`${FUTURES_BASE}/exchangeInfo`)) as { symbols?: BinanceSymbol[] };
-        return (data.symbols ?? [])
-            .filter((s) => s.contractType === 'PERPETUAL' && s.status === 'TRADING')
+        const live = (data.symbols ?? []).filter((s) => s.status === 'TRADING');
+        const perpetuals = live
+            .filter((s) => s.contractType === 'PERPETUAL')
             .map((s) => ({ ticker: `${s.symbol}.P`, description: `${s.baseAsset} / ${s.quoteAsset} Perpetual`, type: 'futures' }));
+        const delivery = live
+            .filter((s) => s.contractType != null && DELIVERY_TYPES.includes(s.contractType))
+            .map((s) => ({ ticker: `${s.symbol}.D`, description: `${s.baseAsset} / ${s.quoteAsset} ${contractLabel(s)}`, type: 'futures' }));
+        return [...perpetuals, ...delivery];
+    }
+
+    /** COIN-M futures (margined in the coin itself): perpetuals first, then quarterlies. */
+    private async listCoinM(): Promise<SymbolDescriptor[]> {
+        const data = (await this.json(`${COIN_FUTURES_BASE}/exchangeInfo`)) as { symbols?: BinanceSymbol[] };
+        // COIN-M reports its trading state as `contractStatus`; the other markets use `status`.
+        const live = (data.symbols ?? []).filter((s) => (s.contractStatus ?? s.status) === 'TRADING');
+        const ordered = [
+            ...live.filter((s) => s.contractType === 'PERPETUAL'),
+            ...live.filter((s) => s.contractType != null && DELIVERY_TYPES.includes(s.contractType)),
+        ];
+        return ordered.map((s) => ({
+            ticker: `${s.symbol}.C`,
+            description: `${s.baseAsset} / ${s.quoteAsset} ${contractLabel(s)} (COIN-M)`,
+            type: 'futures',
+        }));
     }
 
     /** Fetch klines, paginating past Binance's 1000-row cap. */
@@ -430,6 +483,8 @@ interface KlineEvent {
 interface BinanceSymbol {
     symbol: string;
     status?: string;
+    /** COIN-M's name for the trading state (the other markets use `status`). */
+    contractStatus?: string;
     baseAsset: string;
     quoteAsset: string;
     contractType?: string;

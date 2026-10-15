@@ -28,6 +28,12 @@ describe('Binance pure helpers', () => {
         expect(parseTicker('btcusdt.p')).toEqual({ apiSymbol: 'BTCUSDT', isFutures: true }); // upper-cased
     });
 
+    it('parseTicker reads .D as a USDⓈ-M delivery contract and .C as COIN-M', () => {
+        expect(parseTicker('BTCUSDT_261225.D')).toEqual({ apiSymbol: 'BTCUSDT_261225', isFutures: true });
+        expect(parseTicker('BTCUSD_PERP.C')).toEqual({ apiSymbol: 'BTCUSD_PERP', isFutures: true, coinM: true });
+        expect(parseTicker('btcusd_261225.c')).toEqual({ apiSymbol: 'BTCUSD_261225', isFutures: true, coinM: true });
+    });
+
     it('klinesToOHLCV maps raw rows (open-time in ms)', () => {
         const rows = [[1000, '10', '12', '9', '11', '100', 4999]];
         expect(klinesToOHLCV(rows)).toEqual([{ time: 1000, open: 10, high: 12, low: 9, close: 11, volume: 100 }]);
@@ -196,7 +202,86 @@ describe('BinanceProvider — pagination, fallback, enumeration (stubbed fetch)'
         expect(tickers).toContain('BTCUSDT.P'); // perpetual
         expect(tickers).toContain('ETHUSDT.P');
         expect(tickers).not.toContain('OLDX'); // not TRADING
-        expect(tickers).not.toContain('BTCUSDT_240927.P'); // not PERPETUAL
+        expect(tickers).not.toContain('BTCUSDT_240927.P'); // a quarterly is never labelled a perpetual
+    });
+
+    it('listSymbols adds USDⓈ-M quarterlies (.D) and COIN-M contracts (.C), perpetuals first', async () => {
+        const futures = { symbols: [
+            { symbol: 'BTCUSDT_261225', status: 'TRADING', contractType: 'CURRENT_QUARTER', baseAsset: 'BTC', quoteAsset: 'USDT' },
+            { symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', baseAsset: 'BTC', quoteAsset: 'USDT' },
+            { symbol: 'OLDUSDT', status: 'SETTLING', contractType: 'PERPETUAL', baseAsset: 'OLD', quoteAsset: 'USDT' },
+        ] };
+        const coinM = { symbols: [
+            { symbol: 'BTCUSD_261225', contractStatus: 'TRADING', contractType: 'CURRENT_QUARTER', baseAsset: 'BTC', quoteAsset: 'USD' },
+            { symbol: 'BTCUSD_PERP', contractStatus: 'TRADING', contractType: 'PERPETUAL', baseAsset: 'BTC', quoteAsset: 'USD' },
+            { symbol: 'ETHUSD_PERP', contractStatus: 'PENDING_TRADING', contractType: 'PERPETUAL', baseAsset: 'ETH', quoteAsset: 'USD' },
+        ] };
+        vi.stubGlobal('fetch', vi.fn((input: string | URL) => {
+            const url = input.toString();
+            if (url.includes('/ping')) return Promise.resolve(res(true, {}));
+            if (url.includes('dapi') && url.includes('exchangeInfo')) return Promise.resolve(res(true, coinM));
+            if (url.includes('fapi') && url.includes('exchangeInfo')) return Promise.resolve(res(true, futures));
+            if (url.includes('exchangeInfo')) return Promise.resolve(res(true, { symbols: [] }));
+            return Promise.resolve(res(false, {}));
+        }));
+
+        const list = await new BinanceProvider().listSymbols();
+        const tickers = list.map((s) => s.ticker);
+        expect(tickers).toEqual(['BTCUSDT.P', 'BTCUSDT_261225.D', 'BTCUSD_PERP.C', 'BTCUSD_261225.C']);
+        expect(list.every((s) => s.type === 'futures')).toBe(true);
+        expect(list.find((s) => s.ticker === 'BTCUSD_PERP.C')!.description).toBe('BTC / USD Perpetual (COIN-M)');
+        expect(list.find((s) => s.ticker === 'BTCUSDT_261225.D')!.description).toBe('BTC / USDT Quarterly 261225');
+    });
+
+    it('keeps the other lists and warns when one market cannot be listed', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.stubGlobal('fetch', vi.fn((input: string | URL) => {
+            const url = input.toString();
+            if (url.includes('/ping')) return Promise.resolve(res(true, {}));
+            if (url.includes('fapi')) return Promise.resolve(res(false, {}, 451)); // region-blocked
+            if (url.includes('dapi')) return Promise.resolve(res(true, { symbols: [
+                { symbol: 'BTCUSD_PERP', contractStatus: 'TRADING', contractType: 'PERPETUAL', baseAsset: 'BTC', quoteAsset: 'USD' },
+            ] }));
+            return Promise.resolve(res(true, { symbols: [{ symbol: 'BTCUSDT', status: 'TRADING', baseAsset: 'BTC', quoteAsset: 'USDT' }] }));
+        }));
+
+        const tickers = (await new BinanceProvider().listSymbols()).map((s) => s.ticker);
+        expect(tickers).toEqual(['BTCUSDT', 'BTCUSD_PERP.C']);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not list USDⓈ-M futures'));
+        warn.mockRestore();
+    });
+
+    it('routes .C klines to the COIN-M endpoint and .D klines to the USDⓈ-M endpoint', async () => {
+        const calls: string[] = [];
+        vi.stubGlobal('fetch', vi.fn((input: string | URL) => {
+            const url = input.toString();
+            calls.push(url);
+            if (url.includes('/klines')) return Promise.resolve(res(true, [[0, '1', '2', '0', '1', '1', 1]]));
+            return Promise.resolve(res(false, {}));
+        }));
+        const provider = new BinanceProvider();
+
+        await provider.getBars('BTCUSD_PERP.C', '1h', { limit: 1 });
+        await provider.getBars('BTCUSDT_261225.D', '1h', { limit: 1 });
+        expect(calls.some((u) => u.includes('dapi.binance.com/dapi/v1/klines') && u.includes('symbol=BTCUSD_PERP'))).toBe(true);
+        expect(calls.some((u) => u.includes('fapi.binance.com/fapi/v1/klines') && u.includes('symbol=BTCUSDT_261225'))).toBe(true);
+        expect(calls.some((u) => u.includes('.C') || u.includes('.D'))).toBe(false); // suffix stripped for the API
+    });
+
+    it('getSymbolInfo labels a COIN-M quarterly and uses the COIN-M exchangeInfo', async () => {
+        const urls: string[] = [];
+        vi.stubGlobal('fetch', vi.fn((input: string | URL) => {
+            const url = input.toString();
+            urls.push(url);
+            if (url.includes('dapi') && url.includes('exchangeInfo')) return Promise.resolve(res(true, { symbols: [
+                { symbol: 'BTCUSD_261225', contractStatus: 'TRADING', contractType: 'CURRENT_QUARTER', baseAsset: 'BTC', quoteAsset: 'USD', filters: [{ filterType: 'PRICE_FILTER', tickSize: '0.1' }] },
+            ] }));
+            return Promise.resolve(res(false, {}));
+        }));
+
+        const info = await new BinanceProvider().getSymbolInfo('BTCUSD_261225.C');
+        expect(urls.some((u) => u.includes('dapi.binance.com/dapi/v1/exchangeInfo'))).toBe(true);
+        expect(info).toMatchObject({ ticker: 'BTCUSD_261225.C', type: 'futures', currency: 'USD', mintick: 0.1, description: 'BTC / USD Quarterly 261225 (COIN-M)' });
     });
 });
 
@@ -236,6 +321,16 @@ describe('BinanceProvider.subscribe', () => {
         expect(bars).toEqual([{ time: 1000, open: 10, high: 12, low: 9, close: 11, volume: 3 }]);
         unsub();
         expect(ws.readyState).toBe(3); // closed on unsubscribe
+    });
+
+    it('streams a .C ticker from the COIN-M socket host', async () => {
+        const FakeWS = makeFakeWS();
+        vi.stubGlobal('WebSocket', FakeWS);
+        const unsub = new BinanceProvider().subscribe('BTCUSD_PERP.C', '1h', () => {});
+        await vi.waitFor(() => expect(FakeWS.instances.length).toBe(1));
+        expect(FakeWS.instances[0]!.url).toContain('dstream.binance.com');
+        expect(FakeWS.instances[0]!.url).toContain('btcusd_perp@kline_1h');
+        unsub();
     });
 
     it('spot stream picks the WebSocket host matching the resolved REST endpoint', async () => {

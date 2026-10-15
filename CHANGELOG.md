@@ -2,6 +2,22 @@
 
 All notable changes to Vela, newest first.
 
+## [Unreleased]
+
+### Added
+
+- **More Binance futures.** The Binance symbol list now includes USDⓈ-M quarterly futures
+  (`BTCUSDT_261225.D`) and COIN-M futures, perpetual and quarterly (`BTCUSD_PERP.C`,
+  `BTCUSD_261225.C`), next to the perpetuals you already had (`BTCUSDT.P`). They all show under
+  the Futures tab, load history and stream live like the other Binance symbols, and a COIN-M
+  symbol's description says so.
+
+### Changed
+
+- **A market that fails to list is no longer silent.** If Binance blocks one of its markets in
+  your region, the symbol list still shows the others and the browser console now names the
+  market it could not list.
+
 ## [0.8.4]
 
 ### Added

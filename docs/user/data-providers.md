@@ -93,13 +93,16 @@ Registering or replacing a provider on a chart that was given a **custom feed** 
 
 ## The bundled Binance provider
 
-`@luxalgo/vela/providers/binance` is a from-scratch Binance provider (no third-party SDK). It serves spot and USDT-margined perpetual futures (`SYMBOL.P`), paginates past Binance's 1000-candle cap, falls back from `api.binance.com` to `api.binance.us`, and aggregates timeframes Binance doesn't serve natively (e.g. `45`, `180`). No API key. Live ticks stream from a native **kline WebSocket** (spot `stream.binance.com`, perpetuals `fstream.binance.com`), with an automatic **poll fallback** if the socket can't deliver — e.g. where Binance futures streams are geo-restricted — and for aggregated timeframes that have no native stream.
+`@luxalgo/vela/providers/binance` is a from-scratch Binance provider (no third-party SDK). It serves spot, USDⓈ-M perpetual futures (`SYMBOL.P`), USDⓈ-M quarterly futures (`SYMBOL_YYMMDD.D`) and COIN-M perpetual and quarterly futures (`SYMBOL_PERP.C`, `SYMBOL_YYMMDD.C`), paginates past Binance's 1000-candle cap, falls back from `api.binance.com` to `api.binance.us`, and aggregates timeframes Binance doesn't serve natively (e.g. `45`, `180`). No API key. Live ticks stream from a native **kline WebSocket** (spot `stream.binance.com`, USDⓈ-M futures `fstream.binance.com`, COIN-M futures `dstream.binance.com`), with an automatic **poll fallback** if the socket can't deliver — e.g. where Binance futures streams are geo-restricted — and for aggregated timeframes that have no native stream.
 
 ```js
 import { BinanceProvider } from '@luxalgo/vela/providers/binance';
 chart.data.registerProvider('binance', new BinanceProvider());
-// BTCUSDT, ETHUSDT, … (spot) and BTCUSDT.P, ETHUSDT.P, … (perpetuals)
+// BTCUSDT, ETHUSDT, … (spot) and BTCUSDT.P, ETHUSDT.P, … (USDⓈ-M perpetuals)
+// BTCUSDT_261225.D, … (USDⓈ-M quarterlies) and BTCUSD_PERP.C, BTCUSD_261225.C, … (COIN-M)
 ```
+
+The symbol list covers every contract that is trading. If Binance blocks one market in the viewer's region, Vela still lists the others and logs a console warning that names the market it could not list.
 
 ## The bundled Coinbase provider
 
