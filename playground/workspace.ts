@@ -12,6 +12,9 @@ import { BinanceProvider } from "../src/data/providers/binance";
 import { DemoEngine } from "./demo-engine";
 import { playgroundStorage } from "./persistence";
 import { addSampleMarks } from "./marks";
+// Registers the topbar "Replay" button (bar replay across every cell) — import before the
+// workspace is constructed so the action is in place from the first paint.
+import "./replay";
 
 const ws = new VelaWorkspace("#workspace", {
   layout: "4",
